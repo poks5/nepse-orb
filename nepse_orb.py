@@ -16,6 +16,7 @@ import argparse
 import datetime as dt
 import json
 import os
+import statistics
 import sys
 import time
 import urllib.request
@@ -30,6 +31,7 @@ DEFAULTS = {
     "trading_days": [0, 1, 2, 3, 4],   # Mon=0 .. Sun=6 (NEPSE moved to Mon-Fri in 2026)
     "circuit_pct": 15.0,               # daily price band, percent
     "circuit_guard_pct": 1.5,          # skip if within this many pct of the band edge
+    "max_late_start_min": 30,          # a stock whose first trade is later than this after the open is skipped
     "min_price": 0.0,
     "min_turnover": 500000.0,          # NPR traded so far
     "min_breakout_pct": 0.3,           # close must clear the range high by this much (noise filter)
@@ -192,10 +194,18 @@ def contiguous(bars, n_range, cutoff, day, open_t):
 
 def orb_scan(bars_by_sym, n_range, cfg):
     hits, counts = [], {"symbols": len(bars_by_sym), "unusable": 0, "illiquid": 0,
-                        "narrow_or_wide": 0, "near_circuit": 0, "scanned": 0}
+                        "narrow_or_wide": 0, "near_circuit": 0, "scanned": 0,
+                        "too_late": 0, "late_started": 0}
+    scanned = []  # (bars by k, last close) of every stock that passed the filters: the baseline
     for sym, bars in sorted(bars_by_sym.items()):
-        if len(bars) <= n_range or any(b["k"] != i for i, b in enumerate(bars)):
+        # The feed only lists stocks once they have traded, so a stock's opening range
+        # starts at its FIRST bar (k0), not necessarily at the open. Bars must be gap-free from k0.
+        k0 = bars[0]["k"] if bars else 0
+        if len(bars) <= n_range or any(b["k"] != k0 + i for i, b in enumerate(bars)):
             counts["unusable"] += 1
+            continue
+        if k0 * BAR_MIN > cfg["max_late_start_min"]:
+            counts["too_late"] += 1
             continue
         last = bars[-1]
         if last["c"] < cfg["min_price"] or last["turn"] < cfg["min_turnover"]:
@@ -214,6 +224,9 @@ def orb_scan(bars_by_sym, n_range, cfg):
                 counts["near_circuit"] += 1
                 continue
         counts["scanned"] += 1
+        if k0:
+            counts["late_started"] += 1
+        scanned.append(({b["k"]: b for b in bars}, last["c"]))
         # per-bar volume from cumulative volume; range average is cumulative-at-range-end / n_range
         avg_rng_vol = rng[-1]["vol"] / n_range if n_range else 0.0
         for i in range(n_range, len(bars)):
@@ -228,14 +241,26 @@ def orb_scan(bars_by_sym, n_range, cfg):
                              "or_high": round(oh, 2), "or_low": round(ol, 2),
                              "pct_over": round((b["c"] / oh - 1) * 100, 2),
                              "range_pct": round(width, 2),
+                             "range_start": rng[0]["start"].strftime("%H:%M"),
+                             "_k": b["k"],
+                             "last": round(last["c"], 2),
+                             "since_pct": round((last["c"] / b["c"] - 1) * 100, 2),
+                             "peak_pct": round((max(x["h"] for x in bars[i:]) / b["c"] - 1) * 100, 2),
                              "vol_x": None if avg_rng_vol <= 0 else round(bar_vol / avg_rng_vol, 1),
                              "turnover": round(last["turn"]),
                              "chg_vs_prev_close": None if not pc else round((last["c"] / pc - 1) * 100, 2),
                              "_t": closes_at})
                 break
     hits.sort(key=lambda h: (h["_t"], h["symbol"]))
+    # Baseline per breakout bar: median move of ALL scanned stocks from that same bar to the cutoff.
+    base = {}
+    for k in {h["_k"] for h in hits}:
+        ch = [lc / m[k]["c"] - 1 for m, lc in scanned if k in m and m[k]["c"] > 0]
+        base[k] = round(statistics.median(ch) * 100, 2) if ch else 0.0
     for h in hits:
-        del h["_t"]
+        h["base_pct"] = base[h["_k"]]
+        h["excess_pct"] = round(h["since_pct"] - h["base_pct"], 2)
+        del h["_t"], h["_k"]
     counts["hits"] = len(hits)
     return hits, counts
 
@@ -330,14 +355,32 @@ def cmd_scan(a, cfg):
     else:
         print("NEPSE ORB scan %s %s NPT: %d-minute range, %d-minute bars from %d snapshots."
               % (day, cutoff.strftime("%H:%M"), a.or_minutes, BAR_MIN, len(snaps)))
-        print("%d symbols seen; %d scanned (%d unusable, %d illiquid, %d range outside %.1f-%.1f%%, %d near circuit)."
-              % (c["symbols"], c["scanned"], c["unusable"], c["illiquid"], c["narrow_or_wide"],
+        print("%d symbols seen; %d scanned (%d of them began trading after the open, range taken from their first trade)."
+              % (c["symbols"], c["scanned"], c["late_started"]))
+        print("Skipped: %d with gaps in their bars, %d first traded over %d min after the open, %d illiquid, "
+              "%d range outside %.1f-%.1f%%, %d near circuit."
+              % (c["unusable"], c["too_late"], cfg["max_late_start_min"], c["illiquid"], c["narrow_or_wide"],
                  cfg["min_range_pct"], cfg["max_range_pct"], c["near_circuit"]))
         print("%d matched an opening-range breakout rule (matched a rule, not a buy):" % len(hits))
         for h in hits[:a.show]:
-            print("  %s  %-8s Rs %9.2f  range %.2f-%.2f  +%.2f%% over  turnover Rs %s"
+            late = "" if h["range_start"] == cfg["open"] else "  [range from %s]" % h["range_start"]
+            print("  %s  %-8s Rs %9.2f  range %.2f-%.2f  +%.2f%% over  turnover Rs %s  | latest %.2f (%+.2f%%; market %+.2f%%; peak %+.2f%%)%s"
                   % (h["at"], h["symbol"], h["price"], h["or_low"], h["or_high"], h["pct_over"],
-                     format(h["turnover"], ",")))
+                     format(h["turnover"], ","), h["last"], h["since_pct"], h["base_pct"], h["peak_pct"], late))
+        if len(hits) > a.show:
+            print("  ... %d more (use --show 200 to list all)" % (len(hits) - a.show))
+        if hits:
+            ch = sorted(h["since_pct"] for h in hits)
+            up = sum(1 for x in ch if x > 0)
+            print("Since breakout to %s: %d up, %d down, %d flat; median %+.2f%%, best %+.2f%%, worst %+.2f%%."
+                  % (cutoff.strftime("%H:%M"), up, sum(1 for x in ch if x < 0), sum(1 for x in ch if x == 0),
+                     ch[len(ch) // 2], ch[-1], ch[0]))
+            ex = sorted(h["excess_pct"] for h in hits)
+            print("Versus the market baseline (median of all %d scanned stocks, from the same bar to %s): "
+                  "%d beat it, %d lagged it, %d equal; median excess %+.2f%%."
+                  % (c["scanned"], cutoff.strftime("%H:%M"), sum(1 for x in ex if x > 0),
+                     sum(1 for x in ex if x < 0), sum(1 for x in ex if x == 0), ex[len(ex) // 2]))
+            print("One day is one sample. A signal is only interesting if hits beat the baseline on most days.")
     if a.write:
         with open(a.write, "w") as f:
             json.dump({"day": str(day), "as_of": cutoff.strftime("%H:%M"), "hits": hits}, f, indent=1)
@@ -417,7 +460,7 @@ def main(argv=None):
     s.add_argument("--at", help="HH:MM NPT cutoff (default: now)")
     s.add_argument("--day", help="YYYY-MM-DD (default: today)")
     s.add_argument("--or-minutes", type=int, default=15)
-    s.add_argument("--show", type=int, default=30)
+    s.add_argument("--show", type=int, default=200)
     s.add_argument("--json", action="store_true")
     s.add_argument("--write", help="write hits to this JSON file")
     d = sub.add_parser("demo", help="run on synthetic data")

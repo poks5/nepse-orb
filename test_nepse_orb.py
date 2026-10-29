@@ -69,6 +69,42 @@ class OrbTests(unittest.TestCase):
         self.assertEqual(rows[0]["ltp"], 1234.5)
         self.assertEqual(rows[1]["turnover"], 5e6)
 
+    def test_late_starter_gets_range_from_first_trade(self):
+        snaps = o.synth_session(DAY, CFG)
+        t_first = dt.datetime.combine(DAY, dt.time(11, 12))   # BRK1 first appears at 11:12
+        snaps = [(t, [r for r in rows if not (r["symbol"] == "BRK1" and t < t_first)]) for t, rows in snaps]
+        cfg = dict(CFG, min_range_pct=0.1)   # this synthetic late range is only 0.24% wide
+        hits, c = scan("12:30", snaps=snaps, cfg=cfg)
+        by = {h["symbol"]: h for h in hits}
+        self.assertIn("BRK1", by)
+        self.assertEqual(by["BRK1"]["range_start"], "11:10")   # bar containing its first trade
+        self.assertGreaterEqual(c["late_started"], 1)
+
+    def test_very_late_starter_is_skipped(self):
+        snaps = o.synth_session(DAY, CFG)
+        t_first = dt.datetime.combine(DAY, dt.time(11, 50))   # 50 min after the open > 30
+        snaps = [(t, [r for r in rows if not (r["symbol"] == "BRK1" and t < t_first)]) for t, rows in snaps]
+        hits, c = scan("13:30", snaps=snaps)
+        self.assertNotIn("BRK1", {h["symbol"] for h in hits})
+        self.assertGreaterEqual(c["too_late"], 1)
+
+    def test_gap_after_late_start_still_unusable(self):
+        snaps = o.synth_session(DAY, CFG)
+        t_first = dt.datetime.combine(DAY, dt.time(11, 12))
+        gap = dt.datetime.combine(DAY, dt.time(11, 30))
+        snaps = [(t, [r for r in rows if not (r["symbol"] == "BRK1" and (t < t_first or gap <= t < gap + dt.timedelta(minutes=5)))])
+                 for t, rows in snaps]
+        hits, c = scan("12:30", snaps=snaps)
+        self.assertNotIn("BRK1", {h["symbol"] for h in hits})
+
+    def test_baseline_and_excess(self):
+        hits, c = scan("12:30")
+        by = {h["symbol"]: h for h in hits}
+        h = by["BRK1"]
+        self.assertAlmostEqual(h["excess_pct"], h["since_pct"] - h["base_pct"], places=2)
+        self.assertGreater(h["excess_pct"], 3)          # BRK1 rose ~8% while random walkers stayed flat
+        self.assertLess(abs(h["base_pct"]), 2)          # the market baseline is near flat
+
     def test_real_nepse_data_api_rows(self):
         # rows copied from nepse-data-api get_stocks(date='2026-10-28')
         real = [{'id': None, 'businessDate': '2026-10-28', 'securityId': 2790, 'symbol': 'ACLBSL',
