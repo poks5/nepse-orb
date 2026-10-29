@@ -12,14 +12,16 @@ snapshots in `snapshots.jsonl`. `scan` builds 5-minute bars from them. So you mu
 recorder running from 11:00; the scan cannot see anything before that.
 
 ## Run it
-1. Start a NEPSE data server on your PC (any unofficial client with a `/market/live` style
-   JSON endpoint; e.g. NEPSE API Pro: `api-nepse`, then `http://localhost:8080/api/v1/market/live`).
-2. Before 11:00 NPT (trading days are Mon-Fri by default, check the current NEPSE notice):
-   `python3 nepse_orb.py record --source http://localhost:8080/api/v1/market/live`
-3. After 11:20 (15-min range) or 11:35 (30-min range), in another terminal:
+1. Install the data library (no server needed): `pip install nepse-data-api`
+   (alternatively any local server returning live-market JSON; pass its URL as `--source`).
+2. Check the field names once (any time; outside trading hours prices may be stale):
+   `python3 nepse_orb.py inspect --source py:nepse_data_api`
+3. Before 11:00 NPT (trading days are Mon-Fri by default, check the current NEPSE notice):
+   `python3 nepse_orb.py record --source py:nepse_data_api`
+4. After 11:20 (15-min range) or 11:35 (30-min range), in another terminal:
    `python3 nepse_orb.py scan --or-minutes 15`
-4. `python3 nepse_orb.py demo` runs on synthetic data with no network.
-5. `python3 -m unittest -v` runs the tests.
+5. `python3 nepse_orb.py demo` runs on synthetic data with no network.
+6. `python3 -m unittest -v` runs the tests.
 
 If `record` prints "empty response" or the scan sees 0 symbols, the JSON field names differ from
 the ones in `FIELDS` at the top of `nepse_orb.py`. Open the URL in a browser, then add the names.
