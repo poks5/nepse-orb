@@ -42,7 +42,7 @@ DEFAULTS = {
 # Field names differ between unofficial NEPSE clients; first match wins.
 FIELDS = {
     "symbol": ["symbol", "securitySymbol", "s", "ticker"],
-    "ltp": ["lastTradedPrice", "ltp", "lastPrice", "close", "closePrice", "price"],
+    "ltp": ["lastTradedPrice", "lastUpdatedPrice", "ltp", "lastPrice", "closePrice", "close", "price"],
     "volume": ["totalTradeQuantity", "totalTradedQuantity", "volume", "shareTraded", "qty"],
     "turnover": ["totalTradeValue", "totalTradedValue", "turnover", "amount"],
     "prev_close": ["previousClose", "previousDayClosePrice", "prevClose", "prev_close"],
@@ -105,6 +105,21 @@ def fetch_http(url, timeout=20):
     req = urllib.request.Request(url, headers={"User-Agent": "nepse-orb/0.1", "Accept": "application/json"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read().decode("utf-8"))
+
+
+def fetch_source(source):
+    """source = an http(s) URL returning JSON, or 'py:nepse_data_api' to use that
+    library directly (pip install nepse-data-api; no server needed)."""
+    if source.startswith("py:"):
+        mod = source[3:]
+        if mod != "nepse_data_api":
+            raise ValueError("only py:nepse_data_api is supported")
+        try:
+            from nepse_data_api import Nepse  # imported lazily so the demo needs no install
+        except ImportError:
+            raise SystemExit("Library missing. Run:  pip install nepse-data-api   then try again.")
+        return Nepse(enable_cache=False).get_stocks(use_cache=False)
+    return fetch_http(source)
 
 
 def now_npt():
@@ -238,7 +253,7 @@ def cmd_record(a, cfg):
         now = now_npt()
         if trading_day_ok(now.date(), cfg) and open_t <= now.time() < close_t:
             try:
-                rows = normalise(fetch_http(a.source))
+                rows = normalise(fetch_source(a.source))
                 if rows:
                     append_snapshot(cfg["store"], now, rows)
                     print("%s  %d symbols" % (now.strftime("%H:%M:%S"), len(rows)), file=sys.stderr)
@@ -251,6 +266,33 @@ def cmd_record(a, cfg):
         if a.once:
             return 0
         time.sleep(a.every)
+
+
+def cmd_inspect(a, cfg):
+    """Fetch once and show the raw rows next to what the scanner understood."""
+    raw = fetch_source(a.source)
+    rows = raw
+    if isinstance(raw, dict):
+        for k in ("data", "result", "content", "liveMarket"):
+            if isinstance(raw.get(k), list):
+                rows = raw[k]
+                break
+    rows = rows if isinstance(rows, list) else []
+    print("Fetched %d raw rows." % len(rows))
+    for r in rows[:2]:
+        print("RAW   :", json.dumps(r, default=str)[:600])
+    norm = normalise(raw)
+    print("Understood %d rows." % len(norm))
+    for r in norm[:2]:
+        print("MAPPED:", r)
+    if rows and not norm:
+        print("None understood: send me the RAW lines above so I can fix the field names.")
+    elif norm:
+        missing = [k for k in ("volume", "turnover", "prev_close") if not any(r[k] for r in norm)]
+        if missing:
+            print("Warning: no values for %s. Volume/liquidity filters will not work until fixed; send me the RAW lines."
+                  % ", ".join(missing))
+    return 0 if norm else 1
 
 
 def run_scan(snaps, day, cutoff, or_minutes, cfg):
@@ -369,6 +411,8 @@ def main(argv=None):
     r.add_argument("--source", required=True, help="URL returning live-market JSON (e.g. a local NEPSE API server)")
     r.add_argument("--every", type=int, default=60)
     r.add_argument("--once", action="store_true")
+    i = sub.add_parser("inspect", help="fetch once and print raw vs understood rows (field-name check)")
+    i.add_argument("--source", required=True, help="URL, or py:nepse_data_api")
     s = sub.add_parser("scan", help="scan recorded snapshots for opening-range breakouts")
     s.add_argument("--at", help="HH:MM NPT cutoff (default: now)")
     s.add_argument("--day", help="YYYY-MM-DD (default: today)")
@@ -380,7 +424,7 @@ def main(argv=None):
     d.add_argument("--or-minutes", type=int, default=15)
     a = p.parse_args(argv)
     cfg = load_config(a.config)
-    return {"record": cmd_record, "scan": cmd_scan, "demo": cmd_demo}[a.cmd](a, cfg)
+    return {"record": cmd_record, "scan": cmd_scan, "demo": cmd_demo, "inspect": cmd_inspect}[a.cmd](a, cfg)
 
 
 if __name__ == "__main__":

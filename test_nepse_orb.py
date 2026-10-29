@@ -69,6 +69,23 @@ class OrbTests(unittest.TestCase):
         self.assertEqual(rows[0]["ltp"], 1234.5)
         self.assertEqual(rows[1]["turnover"], 5e6)
 
+    def test_real_nepse_data_api_rows(self):
+        # rows copied from nepse-data-api get_stocks(date='2026-10-28')
+        real = [{'id': None, 'businessDate': '2026-10-28', 'securityId': 2790, 'symbol': 'ACLBSL',
+                 'openPrice': 845.0, 'highPrice': 850.0, 'lowPrice': 843.0, 'closePrice': 850.0,
+                 'totalTradedQuantity': 1169, 'totalTradedValue': 988217.5, 'previousDayClosePrice': 842.0,
+                 'lastUpdatedPrice': 851.5, 'totalTrades': 20},
+                {'id': None, 'symbol': 'ADBL', 'highPrice': 338.9, 'lowPrice': 328.0, 'closePrice': 338.9,
+                 'totalTradedQuantity': 60293, 'totalTradedValue': 20155310.4, 'previousDayClosePrice': 331.0}]
+        rows = o.normalise(real)
+        self.assertEqual([r["symbol"] for r in rows], ["ACLBSL", "ADBL"])
+        self.assertEqual(rows[0]["ltp"], 851.5)        # lastUpdatedPrice preferred
+        self.assertEqual(rows[1]["ltp"], 338.9)        # falls back to closePrice
+        self.assertEqual(rows[0]["volume"], 1169)
+        self.assertEqual(rows[0]["turnover"], 988217.5)
+        self.assertEqual(rows[0]["prev_close"], 842.0)
+        self.assertEqual(rows[0]["high"], 850.0)
+
     def test_store_roundtrip_and_scan(self):
         with tempfile.TemporaryDirectory() as d:
             p = os.path.join(d, "s.jsonl")
